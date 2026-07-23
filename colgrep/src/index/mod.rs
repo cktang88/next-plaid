@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use crate::acceleration::apply_acceleration_mode;
 use crate::acceleration::{env_acceleration_mode_lossy, AccelerationMode};
 use crate::embed::build_embedding_text;
-use crate::parser::{build_call_graph, detect_language, extract_units, CodeUnit, Language};
+use crate::parser::{
+    build_call_graph, detect_language, extract_units, CodeUnit, Language, UnitType,
+};
 use crate::signal::{is_interrupted, is_interrupted_outside_critical, CriticalSectionGuard};
 
 use paths::{
@@ -56,11 +58,16 @@ const BUILDING_MARKER: &str = ".building";
 /// more often (more resumable) at the cost of more index-append overhead.
 const BUILD_CHECKPOINT_UNITS: usize = 4096;
 
-/// Keep the default code model's indexing context small. Embedding text puts symbol identity,
-/// signature, documentation, and path first, so these survive truncation; hybrid FTS still
-/// searches the full stored source. Set `COLGREP_INDEX_DOCUMENT_LENGTH=0` to use the model's
-/// native limit, or set a positive token count to choose a different quality/speed tradeoff.
-const DEFAULT_INDEX_DOCUMENT_LENGTH: usize = 64;
+/// Upper bound for adaptive indexing with the default code model. Most code units use much
+/// less based on their AST-derived shape; complex functions can use the full budget.
+const ADAPTIVE_INDEX_DOCUMENT_LENGTH: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexDocumentLength {
+    Native,
+    Fixed(usize),
+    Adaptive,
+}
 
 fn build_checkpoint_units(binary: bool, index_exists: bool) -> usize {
     if binary || !index_exists {
@@ -70,21 +77,69 @@ fn build_checkpoint_units(binary: bool, index_exists: bool) -> usize {
     }
 }
 
-fn index_document_length(model_id: &str) -> Option<usize> {
+fn index_document_length(model_id: &str) -> IndexDocumentLength {
     let override_value = std::env::var("COLGREP_INDEX_DOCUMENT_LENGTH").ok();
     resolve_index_document_length(model_id, override_value.as_deref())
 }
 
-fn resolve_index_document_length(model_id: &str, override_value: Option<&str>) -> Option<usize> {
+fn resolve_index_document_length(
+    model_id: &str,
+    override_value: Option<&str>,
+) -> IndexDocumentLength {
     if let Some(value) = override_value {
         if value == "0" {
-            return None;
+            return IndexDocumentLength::Native;
         }
         if let Ok(length) = value.parse::<usize>() {
-            return Some(length.max(1));
+            return IndexDocumentLength::Fixed(length.max(2));
         }
     }
-    (model_id == crate::model::DEFAULT_MODEL).then_some(DEFAULT_INDEX_DOCUMENT_LENGTH)
+    if model_id == crate::model::DEFAULT_MODEL {
+        IndexDocumentLength::Adaptive
+    } else {
+        IndexDocumentLength::Native
+    }
+}
+
+fn model_document_length(policy: IndexDocumentLength) -> Option<usize> {
+    match policy {
+        IndexDocumentLength::Native => None,
+        IndexDocumentLength::Fixed(length) => Some(length),
+        IndexDocumentLength::Adaptive => Some(ADAPTIVE_INDEX_DOCUMENT_LENGTH),
+    }
+}
+
+/// Choose how much source context is worth embedding for one AST-derived code unit.
+///
+/// Identity and signature metadata come first in `build_embedding_text`, so simple symbols
+/// need little context. Branching and high-complexity functions retain progressively more of
+/// their bodies. Non-AST documents use their line span as the only available structure signal.
+fn code_unit_document_length(unit: &CodeUnit, policy: IndexDocumentLength) -> usize {
+    match policy {
+        IndexDocumentLength::Native => usize::MAX,
+        IndexDocumentLength::Fixed(length) => length,
+        IndexDocumentLength::Adaptive => match unit.unit_type {
+            UnitType::Constant | UnitType::Class => 64,
+            UnitType::Function | UnitType::Method => {
+                if unit.complexity >= 10 {
+                    512
+                } else if unit.complexity >= 5 || unit.has_error_handling {
+                    256
+                } else if unit.complexity >= 2 || unit.has_loops || unit.has_branches {
+                    128
+                } else {
+                    64
+                }
+            }
+            UnitType::RawCode => match unit.end_line.saturating_sub(unit.line) {
+                0..=15 => 64,
+                16..=63 => 128,
+                _ => 256,
+            },
+            UnitType::Section => 128,
+            UnitType::Document => 256,
+        },
+    }
 }
 
 /// Test-only counter of expensive `delete_from_index` invocations.
@@ -434,6 +489,7 @@ pub struct UpdatePlan {
 struct SortedUnit {
     unit: Arc<CodeUnit>,
     text: Arc<str>,
+    max_length: usize,
 }
 
 /// After deduplication: unique texts to encode + a map from original positions
@@ -441,6 +497,7 @@ struct SortedUnit {
 struct PreparedChunk {
     units: Vec<Arc<CodeUnit>>,
     unique_texts: Vec<Arc<str>>,
+    unique_max_lengths: Vec<usize>,
     original_to_unique: Vec<usize>,
 }
 
@@ -488,12 +545,17 @@ struct ChunkForCoding {
 /// When encoding more than this many units, prompt the user unless auto_confirm is set.
 pub const CONFIRMATION_THRESHOLD: usize = 30_000;
 
-fn prepare_units_for_encoding(units: &[CodeUnit], sample_prefix_size: usize) -> Vec<SortedUnit> {
+fn prepare_units_for_encoding(
+    units: &[CodeUnit],
+    sample_prefix_size: usize,
+    document_length: IndexDocumentLength,
+) -> Vec<SortedUnit> {
     let mut items: Vec<SortedUnit> = units
         .iter()
         .map(|unit| SortedUnit {
             unit: Arc::new(unit.clone()),
             text: Arc::<str>::from(build_embedding_text(unit)),
+            max_length: code_unit_document_length(unit, document_length),
         })
         .collect();
 
@@ -531,17 +593,20 @@ fn prepare_units_for_encoding(units: &[CodeUnit], sample_prefix_size: usize) -> 
 /// unit can retrieve its embedding after the GPU pass. On large codebases
 /// this saves ~8% of encoding work (e.g. re-exported types, trait impls).
 fn prepare_deduplicated_chunk(unit_chunk: &[SortedUnit]) -> PreparedChunk {
-    let mut index_by_text: HashMap<&str, usize> = HashMap::new();
+    let mut index_by_text: HashMap<(&str, usize), usize> = HashMap::new();
     let mut unique_texts: Vec<Arc<str>> = Vec::new();
+    let mut unique_max_lengths: Vec<usize> = Vec::new();
     let mut original_to_unique: Vec<usize> = Vec::with_capacity(unit_chunk.len());
 
     for item in unit_chunk.iter() {
-        if let Some(&unique_idx) = index_by_text.get(item.text.as_ref()) {
+        let key = (item.text.as_ref(), item.max_length);
+        if let Some(&unique_idx) = index_by_text.get(&key) {
             original_to_unique.push(unique_idx);
         } else {
             let unique_idx = unique_texts.len();
-            index_by_text.insert(item.text.as_ref(), unique_idx);
+            index_by_text.insert(key, unique_idx);
             unique_texts.push(Arc::clone(&item.text));
+            unique_max_lengths.push(item.max_length);
             original_to_unique.push(unique_idx);
         }
     }
@@ -552,6 +617,7 @@ fn prepare_deduplicated_chunk(unit_chunk: &[SortedUnit]) -> PreparedChunk {
             .map(|item| Arc::clone(&item.unit))
             .collect(),
         unique_texts,
+        unique_max_lengths,
         original_to_unique,
     }
 }
@@ -605,7 +671,8 @@ fn run_tokenize_stage(
             .iter()
             .map(|text| text.as_ref())
             .collect();
-        let prepared_batches = model.tokenize_documents_in_batches(&text_refs)?;
+        let prepared_batches = model
+            .tokenize_documents_in_batches_with_limits(&text_refs, &chunk.unique_max_lengths)?;
 
         sender
             .send(TokenizedChunk {
@@ -1372,7 +1439,7 @@ impl IndexBuilder {
                     .with_batch_size(batch)
                     .with_dynamic_batch(self.dynamic_batch)
                     .with_execution_provider(execution_provider);
-                if let Some(length) = document_length {
+                if let Some(length) = model_document_length(document_length) {
                     builder = builder.with_document_length(length);
                 }
                 builder.build()
@@ -1425,7 +1492,7 @@ impl IndexBuilder {
                 .with_batch_size(batch)
                 .with_dynamic_batch(false)
                 .with_execution_provider(ExecutionProvider::Cpu);
-            if let Some(length) = document_length {
+            if let Some(length) = model_document_length(document_length) {
                 builder = builder.with_document_length(length);
             }
             builder.build()
@@ -2043,7 +2110,11 @@ impl IndexBuilder {
         // the encoding pipeline, which rebuilds their FTS5 entries.
         delete_files_from_index_no_fts_rebuild(index_path, &files_changed)?;
 
-        let sorted_units = prepare_units_for_encoding(&new_units, index_chunk_size);
+        let sorted_units = prepare_units_for_encoding(
+            &new_units,
+            index_chunk_size,
+            index_document_length(&self.model_id),
+        );
         let was_interrupted = self.run_encoding_pipeline(
             &sorted_units,
             index_chunk_size,
@@ -2446,7 +2517,11 @@ impl IndexBuilder {
         delete_files_from_index_no_fts_rebuild(index_path, batch_files)?;
         self.ensure_model_created(batch_units.len())?;
         let pool_factor = self.resolve_pool_factor(batch_units.len());
-        let sorted_units = prepare_units_for_encoding(batch_units, index_chunk_size);
+        let sorted_units = prepare_units_for_encoding(
+            batch_units,
+            index_chunk_size,
+            index_document_length(&self.model_id),
+        );
         let was_interrupted = self.run_encoding_pipeline(
             &sorted_units,
             index_chunk_size,
@@ -2810,7 +2885,11 @@ impl IndexBuilder {
             // new versions; we do a single rebuild after encoding completes.
             delete_files_from_index_no_fts_rebuild(index_path, &plan.changed)?;
 
-            let sorted_units = prepare_units_for_encoding(&new_units, index_chunk_size);
+            let sorted_units = prepare_units_for_encoding(
+                &new_units,
+                index_chunk_size,
+                index_document_length(&self.model_id),
+            );
             let pipeline_interrupted = self.run_encoding_pipeline(
                 &sorted_units,
                 index_chunk_size,
@@ -3249,7 +3328,11 @@ impl IndexBuilder {
         // Compute effective pool factor based on batch size
         let pool_factor = self.resolve_pool_factor(units.len());
 
-        let sorted_units = prepare_units_for_encoding(units, index_chunk_size);
+        let sorted_units = prepare_units_for_encoding(
+            units,
+            index_chunk_size,
+            index_document_length(&self.model_id),
+        );
         self.ensure_model_created(units.len())?;
         let was_interrupted = self.run_encoding_pipeline(
             &sorted_units,
@@ -4650,23 +4733,55 @@ mod tests {
     }
 
     #[test]
-    fn test_default_model_uses_fast_index_document_length() {
+    fn test_default_model_uses_adaptive_index_document_length() {
         assert_eq!(
             resolve_index_document_length(crate::model::DEFAULT_MODEL, None),
-            Some(DEFAULT_INDEX_DOCUMENT_LENGTH)
+            IndexDocumentLength::Adaptive
         );
-        assert_eq!(resolve_index_document_length("other/model", None), None);
+        assert_eq!(
+            resolve_index_document_length("other/model", None),
+            IndexDocumentLength::Native
+        );
         assert_eq!(
             resolve_index_document_length(crate::model::DEFAULT_MODEL, Some("256")),
-            Some(256)
+            IndexDocumentLength::Fixed(256)
         );
         assert_eq!(
             resolve_index_document_length(crate::model::DEFAULT_MODEL, Some("0")),
-            None
+            IndexDocumentLength::Native
         );
         assert_eq!(
             resolve_index_document_length(crate::model::DEFAULT_MODEL, Some("invalid")),
-            Some(DEFAULT_INDEX_DOCUMENT_LENGTH)
+            IndexDocumentLength::Adaptive
+        );
+    }
+
+    #[test]
+    fn test_adaptive_document_length_uses_structure() {
+        let mut unit = CodeUnit::new(
+            "example".to_string(),
+            PathBuf::from("src/example.rs"),
+            1,
+            3,
+            Language::Rust,
+            UnitType::Function,
+            None,
+        );
+        assert_eq!(
+            code_unit_document_length(&unit, IndexDocumentLength::Adaptive),
+            64
+        );
+
+        unit.has_branches = true;
+        assert_eq!(
+            code_unit_document_length(&unit, IndexDocumentLength::Adaptive),
+            128
+        );
+
+        unit.complexity = 10;
+        assert_eq!(
+            code_unit_document_length(&unit, IndexDocumentLength::Adaptive),
+            512
         );
     }
 

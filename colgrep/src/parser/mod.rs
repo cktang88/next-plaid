@@ -157,10 +157,18 @@ pub fn extract_units(path: &Path, source: &str, lang: Language) -> Vec<CodeUnit>
     }
 
     let mut parser = Parser::new();
-    if parser
-        .set_language(&get_tree_sitter_language(lang))
-        .is_err()
+    // The JavaScript grammar treats Flow type annotations as syntax errors and can
+    // fragment one function into branch-sized pseudo-functions. The TSX grammar
+    // accepts the same typed JavaScript shape (with or without JSX), preserving the
+    // coherent outer function for files that opt into Flow.
+    let parser_language = if lang == Language::JavaScript
+        && source.lines().take(20).any(|line| line.contains("@flow"))
     {
+        tree_sitter_typescript::LANGUAGE_TSX.into()
+    } else {
+        get_tree_sitter_language(lang)
+    };
+    if parser.set_language(&parser_language).is_err() {
         return Vec::new();
     }
 
@@ -184,6 +192,7 @@ pub fn extract_units(path: &Path, source: &str, lang: Language) -> Vec<CodeUnit>
         lang,
         &mut units,
         None,
+        false,
         &file_imports,
         0,
         max_depth,
@@ -220,6 +229,7 @@ fn extract_from_node(
     lang: Language,
     units: &mut Vec<CodeUnit>,
     parent_class: Option<&str>,
+    inside_function: bool,
     file_imports: &[String],
     depth: usize,
     max_depth: usize,
@@ -293,6 +303,7 @@ fn extract_from_node(
                             lang,
                             units,
                             Some(&class_name),
+                            inside_function,
                             file_imports,
                             depth + 1,
                             max_depth,
@@ -305,7 +316,14 @@ fn extract_from_node(
         }
     }
     // Check if this is a top-level constant/static declaration (only at module level)
-    else if parent_class.is_none() && is_constant_node(kind, lang) {
+    else if parent_class.is_none()
+        && (!inside_function
+            || !matches!(
+                lang,
+                Language::JavaScript | Language::TypeScript | Language::Vue | Language::Svelte
+            ))
+        && is_constant_node(kind, lang)
+    {
         if let Some(unit) = extract_constant(node, path, lines, bytes, lang, file_imports) {
             units.push(unit);
         }
@@ -323,6 +341,7 @@ fn extract_from_node(
             lang,
             units,
             parent_class,
+            inside_function || is_function_node(kind, lang),
             file_imports,
             depth + 1,
             max_depth,

@@ -25,6 +25,43 @@ function greet(name) {
 }
 
 #[test]
+fn test_flow_exported_function_stays_coherent() {
+    let source = r#"/**
+ * @flow
+ */
+export default function formatConsoleArguments(
+  maybeMessage: any,
+  ...inputArgs: $ReadOnlyArray<any>
+): $ReadOnlyArray<any> {
+  if (inputArgs.length === 0) {
+    return [maybeMessage];
+  }
+  return inputArgs;
+}"#;
+    let units = parse(source, Language::JavaScript, "test.js");
+    let function = get_unit_by_name(&units, "formatConsoleArguments").unwrap();
+
+    assert_eq!(function.line, 1);
+    assert_eq!(function.end_line, 12);
+    assert_eq!(function.complexity, 3);
+    assert!(!units.iter().any(|unit| unit.name == "if"));
+}
+
+#[test]
+fn test_function_locals_are_not_duplicate_constant_units() {
+    let source = r#"const moduleLevel = 1;
+function calculate() {
+  const local = 2;
+  return moduleLevel + local;
+}"#;
+    let units = parse(source, Language::JavaScript, "test.js");
+
+    assert!(get_unit_by_name(&units, "moduleLevel").is_some());
+    assert!(get_unit_by_name(&units, "calculate").is_some());
+    assert!(get_unit_by_name(&units, "local").is_none());
+}
+
+#[test]
 fn test_arrow_function() {
     let source = r#"const add = (a, b) => {
     return a + b;

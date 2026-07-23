@@ -761,6 +761,7 @@ pub struct PreparedDocumentBatch {
 struct TokenizedDocument {
     ids: Vec<u32>,
     type_ids: Vec<u32>,
+    max_length: usize,
 }
 
 fn encoding_worker_count(batch_count: usize, session_count: usize) -> usize {
@@ -1149,13 +1150,39 @@ impl Colbert {
         &self,
         documents: &[&str],
     ) -> Result<Vec<PreparedDocumentBatch>> {
+        self.tokenize_documents_in_batches_with_limits(documents, &[])
+    }
+
+    /// Tokenize documents using a separate maximum sequence length for each document.
+    ///
+    /// An empty `max_lengths` slice uses the model's configured document length for
+    /// every document. Otherwise it must contain one entry per document.
+    pub fn tokenize_documents_in_batches_with_limits(
+        &self,
+        documents: &[&str],
+        max_lengths: &[usize],
+    ) -> Result<Vec<PreparedDocumentBatch>> {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
+        if !max_lengths.is_empty() && max_lengths.len() != documents.len() {
+            anyhow::bail!(
+                "Expected one document length per document, got {} lengths for {} documents",
+                max_lengths.len(),
+                documents.len()
+            );
+        }
 
         let processed_texts = preprocess_texts(&self.config, documents);
-        let tokenized = tokenize_processed_texts_individually(&self.tokenizer, &processed_texts)?;
-        let truncate_limit = self.config.document_length.saturating_sub(1);
+        let mut tokenized =
+            tokenize_processed_texts_individually(&self.tokenizer, &processed_texts)?;
+        for (index, document) in tokenized.iter_mut().enumerate() {
+            document.max_length = max_lengths
+                .get(index)
+                .copied()
+                .unwrap_or(self.config.document_length)
+                .clamp(2, self.config.document_length);
+        }
         let use_gpu_batch_modes =
             !matches!(self.requested_execution_provider, ExecutionProvider::Cpu);
         let use_dynamic_batch = self.dynamic_batch && use_gpu_batch_modes;
@@ -1200,7 +1227,12 @@ impl Colbert {
         // input order in the returned embeddings.
         let prepared_lengths: Vec<usize> = tokenized
             .iter()
-            .map(|doc| doc.ids.len().min(truncate_limit) + 1)
+            .map(|doc| {
+                doc.ids
+                    .len()
+                    .min(doc.max_length.saturating_sub(1))
+                    .saturating_add(1)
+            })
             .collect();
         let mut items: Vec<(usize, usize, TokenizedDocument)> = prepared_lengths
             .into_iter()
@@ -1755,6 +1787,7 @@ fn tokenize_processed_texts_individually(
                 Ok(TokenizedDocument {
                     ids: encoding.get_ids()[..real_len].to_vec(),
                     type_ids: encoding.get_type_ids()[..real_len].to_vec(),
+                    max_length: usize::MAX,
                 })
             })
             .collect::<Vec<_>>()
@@ -1932,9 +1965,10 @@ fn prepare_batch_from_tokenized_documents(
         })?,
     };
 
-    let truncate_limit = max_length.saturating_sub(1);
     let mut batch_max_len = 0usize;
     for doc in &batch_docs {
+        let max_length = doc.max_length.min(max_length);
+        let truncate_limit = max_length.saturating_sub(1);
         let effective_len = if doc.ids.len() > truncate_limit {
             max_length
         } else {
@@ -1969,6 +2003,8 @@ fn prepare_batch_from_tokenized_documents(
     for (row_idx, doc) in batch_docs.into_iter().enumerate() {
         let row_start = row_idx * batch_max_len;
         let real_len = doc.ids.len().max(1);
+        let max_length = doc.max_length.min(max_length);
+        let truncate_limit = max_length.saturating_sub(1);
         let (content_prefix_len, keep_sep) = if real_len > truncate_limit {
             (truncate_limit.saturating_sub(1), true)
         } else {
