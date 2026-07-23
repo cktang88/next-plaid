@@ -56,6 +56,37 @@ const BUILDING_MARKER: &str = ".building";
 /// more often (more resumable) at the cost of more index-append overhead.
 const BUILD_CHECKPOINT_UNITS: usize = 4096;
 
+/// Keep the default code model's indexing context small. Embedding text puts symbol identity,
+/// signature, documentation, and path first, so these survive truncation; hybrid FTS still
+/// searches the full stored source. Set `COLGREP_INDEX_DOCUMENT_LENGTH=0` to use the model's
+/// native limit, or set a positive token count to choose a different quality/speed tradeoff.
+const DEFAULT_INDEX_DOCUMENT_LENGTH: usize = 64;
+
+fn build_checkpoint_units(binary: bool, index_exists: bool) -> usize {
+    if binary || !index_exists {
+        usize::MAX
+    } else {
+        BUILD_CHECKPOINT_UNITS
+    }
+}
+
+fn index_document_length(model_id: &str) -> Option<usize> {
+    let override_value = std::env::var("COLGREP_INDEX_DOCUMENT_LENGTH").ok();
+    resolve_index_document_length(model_id, override_value.as_deref())
+}
+
+fn resolve_index_document_length(model_id: &str, override_value: Option<&str>) -> Option<usize> {
+    if let Some(value) = override_value {
+        if value == "0" {
+            return None;
+        }
+        if let Ok(length) = value.parse::<usize>() {
+            return Some(length.max(1));
+        }
+    }
+    (model_id == crate::model::DEFAULT_MODEL).then_some(DEFAULT_INDEX_DOCUMENT_LENGTH)
+}
+
 /// Test-only counter of expensive `delete_from_index` invocations.
 ///
 /// Issue #116: deleting many files used to call the full-index-rewrite primitive once per
@@ -1327,6 +1358,7 @@ impl IndexBuilder {
             let batch = self
                 .batch_size
                 .unwrap_or_else(crate::config::get_default_batch_size);
+            let document_length = index_document_length(&self.model_id);
 
             // Suppress stderr during model loading to hide CoreML's harmless
             // "Context leak detected" warnings on macOS.
@@ -1334,13 +1366,16 @@ impl IndexBuilder {
             // panic hook and prints it to the restored stderr before resuming,
             // so panics inside the suppressed region remain visible.
             let model = crate::stderr::with_suppressed_stderr(|| {
-                Colbert::builder(&self.model_path)
+                let mut builder = Colbert::builder(&self.model_path)
                     .with_quantized(self.quantized)
                     .with_parallel(num_sessions)
                     .with_batch_size(batch)
                     .with_dynamic_batch(self.dynamic_batch)
-                    .with_execution_provider(execution_provider)
-                    .build()
+                    .with_execution_provider(execution_provider);
+                if let Some(length) = document_length {
+                    builder = builder.with_document_length(length);
+                }
+                builder.build()
             })
             .context("Failed to load ColBERT model")?;
 
@@ -1381,15 +1416,19 @@ impl IndexBuilder {
             .parallel_sessions
             .unwrap_or_else(|| default_index_parallel_sessions(ExecutionProvider::Cpu, usize::MAX));
         let batch = crate::config::DEFAULT_BATCH_SIZE_CPU;
+        let document_length = index_document_length(&self.model_id);
 
         let model = crate::stderr::with_suppressed_stderr(|| {
-            Colbert::builder(&self.model_path)
+            let mut builder = Colbert::builder(&self.model_path)
                 .with_quantized(self.quantized)
                 .with_parallel(num_sessions)
                 .with_batch_size(batch)
                 .with_dynamic_batch(false)
-                .with_execution_provider(ExecutionProvider::Cpu)
-                .build()
+                .with_execution_provider(ExecutionProvider::Cpu);
+            if let Some(length) = document_length {
+                builder = builder.with_document_length(length);
+            }
+            builder.build()
         })
         .context("Failed to load ColBERT model for CPU fallback")?;
 
@@ -2287,17 +2326,14 @@ impl IndexBuilder {
         // Encode in file-coherent batches of ~BUILD_CHECKPOINT_UNITS units, committing state
         // after each batch so interruptions keep finished work.
         //
-        // Binary builds use a single batch instead: the first committed batch
-        // creates the index and every later batch appends via update_append,
-        // which binary indexes reject. One batch keeps the whole build on the
-        // atomic initial-create path (encoded sign bits are ~4x smaller than
-        // residual codes, so holding them in memory is cheap); the cost is
-        // that an interrupted binary build restarts from zero.
-        let checkpoint_units = if self.binary {
-            usize::MAX
-        } else {
-            BUILD_CHECKPOINT_UNITS
-        };
+        // A fresh build uses a single batch so the initial-create path writes the index once.
+        // Repeated update_append calls rebuild index-wide IVF data, making a new index
+        // quadratic in its number of checkpoints. A resumed build keeps the smaller
+        // checkpoints so an interruption only loses its current batch.
+        //
+        // Binary builds also require one batch because they cannot be appended to.
+        let checkpoint_units =
+            build_checkpoint_units(self.binary, index_dir.join("metadata.json").exists());
         let encode_pb = ProgressBar::new(total_units as u64);
         encode_pb.set_style(
             ProgressStyle::default_bar()
@@ -4596,6 +4632,43 @@ fn prompt_large_index_confirmation(num_units: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fresh_build_uses_single_write() {
+        assert_eq!(build_checkpoint_units(false, false), usize::MAX);
+    }
+
+    #[test]
+    fn test_resumed_build_keeps_checkpoints() {
+        assert_eq!(build_checkpoint_units(false, true), BUILD_CHECKPOINT_UNITS);
+    }
+
+    #[test]
+    fn test_binary_build_uses_single_write() {
+        assert_eq!(build_checkpoint_units(true, false), usize::MAX);
+        assert_eq!(build_checkpoint_units(true, true), usize::MAX);
+    }
+
+    #[test]
+    fn test_default_model_uses_fast_index_document_length() {
+        assert_eq!(
+            resolve_index_document_length(crate::model::DEFAULT_MODEL, None),
+            Some(DEFAULT_INDEX_DOCUMENT_LENGTH)
+        );
+        assert_eq!(resolve_index_document_length("other/model", None), None);
+        assert_eq!(
+            resolve_index_document_length(crate::model::DEFAULT_MODEL, Some("256")),
+            Some(256)
+        );
+        assert_eq!(
+            resolve_index_document_length(crate::model::DEFAULT_MODEL, Some("0")),
+            None
+        );
+        assert_eq!(
+            resolve_index_document_length(crate::model::DEFAULT_MODEL, Some("invalid")),
+            Some(DEFAULT_INDEX_DOCUMENT_LENGTH)
+        );
+    }
 
     /// The mtime fast path in `compute_update_plan` must skip content hashing
     /// for files whose stored mtime is unchanged. The stored hash is wrong on

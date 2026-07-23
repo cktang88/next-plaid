@@ -763,6 +763,10 @@ struct TokenizedDocument {
     type_ids: Vec<u32>,
 }
 
+fn encoding_worker_count(batch_count: usize, session_count: usize) -> usize {
+    batch_count.min(session_count).max(1)
+}
+
 impl PreparedDocumentBatch {
     pub fn batch_size(&self) -> usize {
         self.batch_size
@@ -1308,41 +1312,60 @@ impl Colbert {
             all_embeddings
         } else {
             let cancel_ref = cancel;
-            let results: Vec<Result<Vec<Array2<f32>>>> = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(prepared_batches.len());
+            let worker_count = encoding_worker_count(prepared_batches.len(), self.sessions.len());
+            let work: Mutex<VecDeque<(usize, PreparedDocumentBatch)>> =
+                Mutex::new(prepared_batches.into_iter().enumerate().collect());
+            let mut results: Vec<(usize, Vec<Array2<f32>>)> =
+                std::thread::scope(|scope| -> Result<_> {
+                    let mut handles = Vec::with_capacity(worker_count);
 
-                for (i, prepared_batch) in prepared_batches.into_iter().enumerate() {
-                    let session_idx = i % self.sessions.len();
-                    let session_mutex = &self.sessions[session_idx];
-                    let config = &self.config;
-                    let skiplist_ids = &self.skiplist_ids;
+                    for session_idx in 0..worker_count {
+                        let session_mutex = &self.sessions[session_idx];
+                        let config = &self.config;
+                        let skiplist_ids = &self.skiplist_ids;
+                        let work = &work;
 
-                    handles.push(scope.spawn(move || {
-                        // Skip not-yet-started batches once cancelled; already-running
-                        // forward passes finish (one `session.run`), so the whole call
-                        // returns within ~one batch of a Ctrl+C.
-                        if cancel_ref.map(|c| c()).unwrap_or(false) {
-                            anyhow::bail!("encoding cancelled");
-                        }
-                        let mut session = session_mutex.lock().unwrap();
-                        encode_prepared_batch_with_session(
-                            &mut session,
-                            config,
-                            skiplist_ids,
-                            prepared_batch,
-                        )
-                    }));
-                }
+                        handles.push(scope.spawn(move || -> Result<_> {
+                            let mut session = session_mutex.lock().unwrap();
+                            let mut encoded_batches = Vec::new();
+                            loop {
+                                let Some((batch_index, prepared_batch)) =
+                                    work.lock().unwrap().pop_front()
+                                else {
+                                    break;
+                                };
+                                // Skip not-yet-started batches once cancelled; already-running
+                                // forward passes finish (one `session.run`), so the whole call
+                                // returns within ~one batch of a Ctrl+C.
+                                if cancel_ref.map(|c| c()).unwrap_or(false) {
+                                    anyhow::bail!("encoding cancelled");
+                                }
+                                let embeddings = encode_prepared_batch_with_session(
+                                    &mut session,
+                                    config,
+                                    skiplist_ids,
+                                    prepared_batch,
+                                )?;
+                                encoded_batches.push((batch_index, embeddings));
+                            }
+                            Ok(encoded_batches)
+                        }));
+                    }
 
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().unwrap())
-                    .collect()
-            });
+                    let mut results = Vec::new();
+                    for handle in handles {
+                        let worker_results = handle
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("encoding worker thread panicked"))??;
+                        results.extend(worker_results);
+                    }
+                    Ok(results)
+                })?;
 
+            results.sort_unstable_by_key(|(batch_index, _)| *batch_index);
             let mut all_embeddings = Vec::new();
-            for result in results {
-                all_embeddings.extend(result?);
+            for (_, batch_embeddings) in results {
+                all_embeddings.extend(batch_embeddings);
             }
             all_embeddings
         };
@@ -2319,6 +2342,13 @@ fn pool_embeddings_hierarchical(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encoding_worker_count_is_bounded() {
+        assert_eq!(encoding_worker_count(1024, 14), 14);
+        assert_eq!(encoding_worker_count(2, 14), 2);
+        assert_eq!(encoding_worker_count(0, 14), 1);
+    }
 
     // =========================================================================
     // ColbertConfig tests
